@@ -1,0 +1,397 @@
+name: Check PR Checklist
+
+on:
+  workflow_run:
+    workflows: [Check File Size, Check Image EXIF Data]
+    types: [completed]
+  pull_request_target:
+    types: [edited]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: checklist-${{ github.event.workflow_run.head_sha || github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+
+jobs:
+  check-checklist:
+    name: Check PR template checklist
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check and update PR checklist
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const STICKY_MARKER = '<!-- pr-checklist-auto-check -->';
+            const CHECKBOX_LINE = /^\s*[-*]\s*\[[ xX]\]/;
+            const CHECKED_LINE = /^\s*[-*]\s*\[[xX]\]/;
+            const UNCHECKED_BOX = /^(\s*[-*]\s*\[)\s(\]\s*)/;
+
+            const checklistItems = [
+              {
+                key: 'size',
+                label: '图片已压缩至 1MB 以内 / Images are compressed to under 1MB',
+                workflow: {
+                  id: 'check_file_size.yml',
+                  name: 'Check File Size',
+                },
+                matchers: [/图片已压缩.*1\s*MB/i, /Images are compressed.*under\s*1\s*MB/i],
+              },
+              {
+                key: 'exif',
+                label: '已移除图片中的 EXIF 高敏感信息 / High-sensitivity EXIF data has been removed from images',
+                workflow: {
+                  id: 'check_exif.yml',
+                  name: 'Check Image EXIF Data',
+                },
+                matchers: [/已移除图片中的\s*EXIF/i, /EXIF data has been removed/i],
+              },
+              {
+                key: 'folder',
+                label: '文件夹按首字母归类且不会影响排序 / Folder is placed under the correct alphabetical directory',
+                matchers: [/文件夹按首字母归类/i, /Folder is placed under the correct alphabetical directory/i],
+              },
+              {
+                key: 'original',
+                label: '图片为本人原创，未盗用他人作品 / Images are original and not stolen from others',
+                matchers: [/图片为本人原创/i, /not stolen from others/i],
+              },
+            ];
+
+            async function getPullRequest() {
+              if (context.payload.pull_request) return context.payload.pull_request;
+
+              const workflowRun = context.payload.workflow_run;
+              const associatedNumbers = new Set(
+                (workflowRun.pull_requests || []).map(pull => pull.number)
+              );
+              const { data: associatedPulls } =
+                await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner,
+                  repo,
+                  commit_sha: workflowRun.head_sha,
+                });
+
+              let pull = associatedPulls.find(candidate =>
+                candidate.state === 'open' &&
+                candidate.head.sha === workflowRun.head_sha &&
+                (associatedNumbers.size === 0 || associatedNumbers.has(candidate.number))
+              );
+
+              // Open fork PRs can be absent from both workflow_run.pull_requests and
+              // listPullRequestsAssociatedWithCommit, so fall back to the head branch.
+              const headOwner = workflowRun.head_repository?.owner?.login;
+              if (!pull && headOwner && workflowRun.head_branch) {
+                const { data: branchPulls } = await github.rest.pulls.list({
+                  owner,
+                  repo,
+                  state: 'open',
+                  head: `${headOwner}:${workflowRun.head_branch}`,
+                  per_page: 100,
+                });
+                pull = branchPulls.find(candidate =>
+                  candidate.head.sha === workflowRun.head_sha
+                );
+              }
+
+              if (!pull) {
+                core.info(`No open PR found for workflow run ${workflowRun.id}.`);
+                return null;
+              }
+
+              const { data } = await github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: pull.number,
+              });
+              return data;
+            }
+
+            async function getLatestWorkflowRun(workflowId, headSha, pullNumber) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: workflowId,
+                event: 'pull_request_target',
+                head_sha: headSha,
+                per_page: 20,
+              });
+
+              // pull_request_target runs may omit pull_requests, so head_sha is the fallback key.
+              return data.workflow_runs
+                .filter(run =>
+                  run.head_sha === headSha &&
+                  (
+                    (run.pull_requests || []).length === 0 ||
+                    run.pull_requests.some(pull => pull.number === pullNumber)
+                  )
+                )
+                .sort((left, right) => right.id - left.id)[0] || null;
+            }
+
+            async function listChangedFiles(pr) {
+              const files = [];
+              for (let page = 1; ; page++) {
+                const { data } = await github.rest.repos.compareCommitsWithBasehead({
+                  owner,
+                  repo,
+                  basehead: `${pr.base.sha}...${pr.head.sha}`,
+                  per_page: 100,
+                  page,
+                });
+                const pageFiles = data.files || [];
+                files.push(...pageFiles);
+                if (pageFiles.length < 100) return files;
+              }
+            }
+
+            function expectedBucket(folderName) {
+              const first = folderName.trim().charAt(0);
+              return /^[A-Za-z]$/.test(first) ? first.toUpperCase() : '#';
+            }
+
+            function checkFolderPlacement(changedFiles) {
+              const activeStatuses = new Set(['added', 'modified', 'renamed', 'copied']);
+              const rootExemptions = new Set([
+                '.gitattributes',
+                '.gitignore',
+                'CONTRIBUTING.md',
+                'EXIF.md',
+                'GUIDE.md',
+                'LICENSE',
+                'README.md',
+                'README_DETAIL.md',
+              ]);
+              const invalid = [];
+
+              for (const fileInfo of changedFiles) {
+                if (!activeStatuses.has(fileInfo.status)) continue;
+
+                const file = fileInfo.filename.replace(/\\/g, '/');
+                const parts = file.split('/').filter(Boolean);
+                if (parts[0] === '.github') continue;
+                if (parts.length === 1 && rootExemptions.has(parts[0])) continue;
+
+                if (parts.length < 3) {
+                  invalid.push(`${file}（文件应位于 A-Z/# 下的个人文件夹内）`);
+                  continue;
+                }
+
+                const actualBucket = parts[0];
+                const contributorFolder = parts[1];
+                const expected = expectedBucket(contributorFolder);
+                if (actualBucket !== expected) {
+                  invalid.push(`${file}（应位于 ${expected}/${contributorFolder}/...）`);
+                }
+              }
+
+              return { passed: invalid.length === 0, invalid };
+            }
+
+            async function findStickyComment(prNumber) {
+              for (let page = 1; ; page++) {
+                const { data: comments } = await github.rest.issues.listComments({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  per_page: 100,
+                  page,
+                });
+                const comment = comments.find(item =>
+                  item.body && item.body.includes(STICKY_MARKER)
+                );
+                if (comment || comments.length < 100) return comment || null;
+              }
+            }
+
+            async function upsertStickyComment(prNumber, body) {
+              const existing = await findStickyComment(prNumber);
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  body,
+                });
+              }
+            }
+
+            const pr = await getPullRequest();
+            if (!pr) return;
+
+            const prNumber = pr.number;
+            const body = pr.body || '';
+            const newline = body.includes('\r\n') ? '\r\n' : '\n';
+            const lines = body.split(/\r?\n/);
+
+            function findChecklistLine(matchers) {
+              return lines.findIndex(line =>
+                CHECKBOX_LINE.test(line) && matchers.some(matcher => matcher.test(line))
+              );
+            }
+
+            function isChecked(item) {
+              return item.index >= 0 && CHECKED_LINE.test(lines[item.index]);
+            }
+
+            function markChecked(item) {
+              lines[item.index] = lines[item.index].replace(UNCHECKED_BOX, '$1x$2');
+            }
+
+            for (const item of checklistItems) {
+              item.index = findChecklistLine(item.matchers);
+            }
+
+            const workflowItems = checklistItems.filter(item => item.workflow);
+            for (const item of workflowItems) {
+              item.run = await getLatestWorkflowRun(
+                item.workflow.id,
+                pr.head.sha,
+                prNumber
+              );
+            }
+
+            const activeRuns = workflowItems.filter(item =>
+              item.run && item.run.status !== 'completed'
+            );
+            if (activeRuns.length > 0) {
+              core.info(
+                `Waiting for: ${activeRuns.map(item => item.workflow.name).join(', ')}`
+              );
+              return;
+            }
+
+            const folderItem = checklistItems.find(item => item.key === 'folder');
+            let folderResult;
+            try {
+              folderResult = checkFolderPlacement(await listChangedFiles(pr));
+            } catch (error) {
+              core.warning(`Cannot check folder placement: ${error.message}`);
+              folderResult = { passed: false, invalid: [], error: error.message };
+            }
+
+            for (const item of workflowItems) {
+              item.autoPassed = item.run?.conclusion === 'success';
+            }
+            folderItem.autoPassed = folderResult.passed;
+            const automatedItems = [...workflowItems, folderItem];
+
+            // Preserve contributor confirmations and only fill unchecked, verified items.
+            const fallbackChecked = [];
+            for (const item of automatedItems) {
+              if (item.autoPassed && item.index >= 0 && !isChecked(item)) {
+                markChecked(item);
+                fallbackChecked.push(item);
+              }
+            }
+
+            const updatedBody = lines.join(newline);
+            if (updatedBody !== body) {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body: updatedBody,
+              });
+            }
+
+            const missingItems = checklistItems.filter(item => item.index < 0);
+            const uncheckedItems = checklistItems.filter(item =>
+              item.index >= 0 && !isChecked(item)
+            );
+            const unsuccessfulChecks = workflowItems.filter(item =>
+              item.run && item.run.conclusion !== 'success'
+            );
+            const unavailableChecks = workflowItems.filter(item => !item.run);
+
+            const commentLines = [
+              STICKY_MARKER,
+              '**PR 检查清单 / PR checklist**',
+              '',
+            ];
+
+            if (fallbackChecked.length > 0) {
+              commentLines.push('以下项目未由贡献者勾选，已在自动检查通过后补充勾选：');
+              commentLines.push(...fallbackChecked.map(item => `- ${item.label}`));
+              commentLines.push('');
+            }
+
+            if (unsuccessfulChecks.length > 0) {
+              commentLines.push('以下自动检查未成功，因此未自动勾选对应项目：');
+              commentLines.push(...unsuccessfulChecks.map(item =>
+                `- ${item.workflow.name}: ${item.run.conclusion}`
+              ));
+              commentLines.push('');
+            }
+
+            if (unavailableChecks.length > 0) {
+              commentLines.push('以下自动检查在当前提交上没有运行结果，因此未自动勾选对应项目：');
+              commentLines.push(...unavailableChecks.map(item => `- ${item.workflow.name}`));
+              commentLines.push('');
+            }
+
+            if (!folderResult.passed) {
+              commentLines.push('目录归类检查未通过，因此未自动勾选对应项目：');
+              if (folderResult.invalid.length > 0) {
+                commentLines.push(...folderResult.invalid.map(file => `- ${file}`));
+              } else {
+                commentLines.push(`- 无法完成检查：${folderResult.error}`);
+              }
+              commentLines.push('');
+            }
+
+            if (missingItems.length > 0) {
+              commentLines.push('PR 描述中缺少模板检查项：');
+              commentLines.push(...missingItems.map(item => `- ${item.label}`));
+              commentLines.push('');
+            }
+
+            if (uncheckedItems.length > 0) {
+              commentLines.push('仍需确认并勾选：');
+              commentLines.push(...uncheckedItems.map(item => `- ${item.label}`));
+              commentLines.push('');
+            }
+
+            const incomplete =
+              missingItems.length > 0 ||
+              uncheckedItems.length > 0 ||
+              !folderResult.passed;
+            if (incomplete || fallbackChecked.length > 0) {
+              commentLines.push(
+                incomplete
+                  ? '请完成以上检查清单。'
+                  : '检查清单已全部完成。'
+              );
+              await upsertStickyComment(prNumber, commentLines.join('\n').trim());
+            } else {
+              const existing = await findStickyComment(prNumber);
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                  body: [
+                    STICKY_MARKER,
+                    '**PR 检查清单 / PR checklist**',
+                    '',
+                    '检查清单已全部完成。',
+                  ].join('\n'),
+                });
+              }
+            }
+
+            if (incomplete) {
+              core.setFailed('PR checklist is incomplete.');
+            }
