@@ -1,6 +1,6 @@
 name: Check Image EXIF Data
 
-run-name: PR #${{ github.event.pull_request.number || inputs.pr_number }} (${{ github.event.pull_request.head.sha || inputs.head_sha }})
+run-name: "PR #${{ github.event.pull_request.number || inputs.pr_number }} (${{ github.event.pull_request.head.sha || inputs.head_sha }})"
 
 on:
   pull_request_target:
