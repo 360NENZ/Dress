@@ -43,6 +43,8 @@ jobs:
             const CHECKBOX_LINE = /^\s*[-*]\s*\[[ xX]\]/;
             const CHECKED_LINE = /^\s*[-*]\s*\[[xX]\]/;
             const UNCHECKED_BOX = /^(\s*[-*]\s*\[)\s(\]\s*)/;
+            const CHECKED_BOX = /^(\s*[-*]\s*\[)[xX](\]\s*)/;
+            const IMAGE_ITEM_KEYS = new Set(['size', 'exif', 'original']);
 
             const checklistItems = [
               {
@@ -304,6 +306,10 @@ jobs:
               lines[item.index] = lines[item.index].replace(UNCHECKED_BOX, '$1x$2');
             }
 
+            function markUnchecked(item) {
+              lines[item.index] = lines[item.index].replace(CHECKED_BOX, '$1 $2');
+            }
+
             for (const item of checklistItems) {
               item.index = findChecklistLine(item.matchers);
             }
@@ -372,7 +378,7 @@ jobs:
 
             for (const item of workflowItems) {
               const imageItemWithoutImages =
-                noChangedImages && (item.key === 'size' || item.key === 'exif');
+                noChangedImages && IMAGE_ITEM_KEYS.has(item.key);
               item.autoPassed =
                 !imageItemWithoutImages &&
                 (
@@ -383,7 +389,15 @@ jobs:
             folderItem.autoPassed = folderResult.passed;
             const automatedItems = [...workflowItems, folderItem];
 
-            // Preserve contributor confirmations and only fill unchecked, verified items.
+            if (noChangedImages) {
+              for (const item of checklistItems) {
+                if (IMAGE_ITEM_KEYS.has(item.key) && item.index >= 0 && isChecked(item)) {
+                  markUnchecked(item);
+                }
+              }
+            }
+
+            // Preserve applicable contributor confirmations and only fill verified items.
             const fallbackChecked = [];
             for (const item of automatedItems) {
               if (item.autoPassed && item.index >= 0 && !isChecked(item)) {
