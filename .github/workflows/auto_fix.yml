@@ -195,6 +195,11 @@ jobs:
             --ref "$DEFAULT_BRANCH" \
             -f pr_number="$PR_NUMBER" \
             -f head_sha="$head_sha"
+          gh workflow run check_pr_checklist.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$DEFAULT_BRANCH" \
+            -f pr_number="$PR_NUMBER" \
+            -f head_sha="$head_sha"
 
       - name: Report Completion
         if: always()
