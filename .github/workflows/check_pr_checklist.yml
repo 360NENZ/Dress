@@ -371,8 +371,10 @@ jobs:
             }
 
             for (const item of workflowItems) {
+              const imageItemWithoutImages =
+                noChangedImages && (item.key === 'size' || item.key === 'exif');
               item.autoPassed =
-                !(item.key === 'exif' && noChangedImages) &&
+                !imageItemWithoutImages &&
                 (
                   !requiredWorkflowItems.includes(item) ||
                   item.run?.conclusion === 'success'
