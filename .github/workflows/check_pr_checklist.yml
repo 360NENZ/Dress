@@ -284,6 +284,50 @@ jobs:
               }
             }
 
+            function isFirstSubmissionComment(body) {
+              return Boolean(body) && (
+                /感谢提交\s*PR/i.test(body) ||
+                /thanks for opening the Pull Request/i.test(body)
+              );
+            }
+
+            async function hasFirstSubmissionComment(prNumber) {
+              for (let attempt = 0; attempt < 6; attempt++) {
+                for (let page = 1; ; page++) {
+                  const { data: comments } = await github.rest.issues.listComments({
+                    owner,
+                    repo,
+                    issue_number: prNumber,
+                    per_page: 100,
+                    page,
+                  });
+                  if (comments.some(comment => isFirstSubmissionComment(comment.body))) {
+                    return true;
+                  }
+                  if (comments.length < 100) break;
+                }
+
+                for (let page = 1; ; page++) {
+                  const { data: reviews } = await github.rest.pulls.listReviews({
+                    owner,
+                    repo,
+                    pull_number: prNumber,
+                    per_page: 100,
+                    page,
+                  });
+                  if (reviews.some(review => isFirstSubmissionComment(review.body))) {
+                    return true;
+                  }
+                  if (reviews.length < 100) break;
+                }
+
+                if (attempt < 5) {
+                  await new Promise(resolve => setTimeout(resolve, 3000));
+                }
+              }
+              return false;
+            }
+
             const pr = await getPullRequest();
             if (!pr) return;
 
@@ -494,20 +538,16 @@ jobs:
               );
               await upsertStickyComment(prNumber, commentLines.join('\n').trim());
             } else {
-              const existing = await findStickyComment(prNumber);
-              if (existing) {
-                await github.rest.issues.updateComment({
-                  owner,
-                  repo,
-                  comment_id: existing.id,
-                  body: [
-                    STICKY_MARKER,
-                    '**PR 检查清单 / PR checklist**',
-                    '',
-                    '检查清单已全部完成。',
-                  ].join('\n'),
-                });
+              const completionLines = [
+                STICKY_MARKER,
+                '**PR 检查清单 / PR checklist**',
+                '',
+                '检查清单已全部完成。',
+              ];
+              if (!await hasFirstSubmissionComment(prNumber)) {
+                completionLines.push('', '我们会尽早审核回应😊');
               }
+              await upsertStickyComment(prNumber, completionLines.join('\n'));
             }
 
             if (incomplete) {
